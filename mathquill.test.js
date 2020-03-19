@@ -838,6 +838,19 @@ var Cursor = P(Point, function(_) {
     }
     return seln;
   };
+  _.depth = function() {
+    var node = this;
+    var depth = 0;
+    while (node = node.parent) {
+      depth += (node instanceof MathBlock) ? 1 : 0;
+    }
+    return depth;
+  };
+  _.isTooDeep = function(offset) {
+    if (this.options.maxDepth !== undefined) {
+      return this.depth() + (offset || 0) > this.options.maxDepth;
+    }
+  };
 });
 
 var Selection = P(Fragment, function(_, super_) {
@@ -1065,9 +1078,18 @@ function getInterface(v) {
       if (this.__controller.blurred) this.__controller.cursor.hide().parent.blur();
       return this;
     };
+    _.empty = function() {
+      var root = this.__controller.root, cursor = this.__controller.cursor;
+      root.eachChild('postOrder', 'dispose');
+      root.ends[L] = root.ends[R] = 0;
+      root.jQ.empty();
+      delete cursor.selection;
+      cursor.insAtRightEnd(root);
+      return this;
+    };
     _.cmd = function(cmd) {
       var ctrlr = this.__controller.notify(), cursor = ctrlr.cursor;
-      if (/^\\[a-z]+$/i.test(cmd)) {
+      if (/^\\[a-z]+$/i.test(cmd) && !cursor.isTooDeep()) {
         cmd = cmd.slice(1);
         var klass = LatexCmds[cmd];
         if (klass) {
@@ -1713,6 +1735,10 @@ Controller.open(function(_, super_) {
   _.exportLatex = function() {
     return this.root.latex().replace(/(\\[a-z]+) (?![a-z])/ig,'$1');
   };
+
+  optionProcessors.maxDepth = function(depth) {
+    return (typeof depth === 'number') ? depth : undefined;
+  };
   _.writeLatex = function(latex) {
     var cursor = this.notify('edit').cursor;
 
@@ -1721,7 +1747,7 @@ Controller.open(function(_, super_) {
 
     var block = latexMathParser.skip(eof).or(all.result(false)).parse(latex);
 
-    if (block && !block.isEmpty()) {
+    if (block && !block.isEmpty() && block.prepareInsertionAt(cursor)) {
       block.children().adopt(cursor.parent, cursor[L], cursor[R]);
       var jQ = block.jQize();
       jQ.insertBefore(cursor.jQ);
@@ -1735,7 +1761,10 @@ Controller.open(function(_, super_) {
     return this;
   };
   _.renderLatexMath = function(latex) {
-    var root = this.root, cursor = this.cursor;
+    var root = this.root;
+    var cursor = this.cursor;
+    var options = cursor.options;
+    var jQ = root.jQ;
 
     var all = Parser.all;
     var eof = Parser.eof;
@@ -1745,13 +1774,8 @@ Controller.open(function(_, super_) {
     root.eachChild('postOrder', 'dispose');
     root.ends[L] = root.ends[R] = 0;
 
-    if (block) {
+    if (block && block.prepareInsertionAt(cursor)) {
       block.children().adopt(root, 0, 0);
-    }
-
-    var jQ = root.jQ;
-
-    if (block) {
       var html = block.join('html');
       jQ.html(html);
       root.jQize(jQ.children());
@@ -2122,11 +2146,15 @@ Controller.open(function(_) {
   _.ctrlDeleteDir = function(dir) {
     prayDirection(dir);
     var cursor = this.cursor;
-    if (!cursor[L] || cursor.selection) return this.deleteDir();
+    if (!cursor[dir] || cursor.selection) return this.deleteDir(dir);
 
     this.notify('edit');
-    Fragment(cursor.parent.ends[L], cursor[L]).remove();
-    cursor.insAtDirEnd(L, cursor.parent);
+    if (dir === L) {
+      Fragment(cursor.parent.ends[L], cursor[L]).remove();
+    } else {
+      Fragment(cursor[R], cursor.parent.ends[R]).remove();
+    };
+    cursor.insAtDirEnd(dir, cursor.parent);
 
     if (cursor[L].siblingDeleted) cursor[L].siblingDeleted(cursor.options, R);
     if (cursor[R].siblingDeleted) cursor[R].siblingDeleted(cursor.options, L);
@@ -2431,6 +2459,43 @@ var MathElement = P(Node, function(_, super_) {
     if (self[L].siblingCreated) self[L].siblingCreated(options, R);
     self.bubble('reflow');
   };
+  // If the maxDepth option is set, make sure
+  // deeply nested content is truncated. Just return
+  // false if the cursor is already too deep.
+  _.prepareInsertionAt = function(cursor) {
+    var maxDepth = cursor.options.maxDepth;
+    if (maxDepth !== undefined) {
+      var cursorDepth = cursor.depth();
+      if (cursorDepth > maxDepth) {
+        return false;
+      }
+      this.removeNodesDeeperThan(maxDepth-cursorDepth);
+    }
+    return true;
+  };
+  // Remove nodes that are more than `cutoff`
+  // blocks deep from this node.
+  _.removeNodesDeeperThan = function (cutoff) {
+    var depth = 0;
+    var queue = [[this, depth]];
+    var current;
+
+    // Do a breadth-first search of this node's descendants
+    // down to cutoff, removing anything deeper.
+    while (queue.length) {
+      current = queue.shift();
+      current[0].children().each(function (child) {
+        var i = (child instanceof MathBlock) ? 1 : 0;
+        depth = current[1]+i;
+
+        if (depth <= cutoff) {
+          queue.push([child, depth]);
+        } else {
+          (i ? child.children() : child).remove();
+        }
+      });
+    }
+  };
 });
 
 /**
@@ -2483,6 +2548,8 @@ var MathCommand = P(MathElement, function(_, super_) {
     if (replacedFragment) {
       replacedFragment.adopt(cmd.ends[L], 0, 0);
       replacedFragment.jQ.appendTo(cmd.ends[L].jQ);
+      cmd.placeCursor(cursor);
+      cmd.prepareInsertionAt(cursor);
     }
     cmd.finalizeInsert(cursor.options);
     cmd.placeCursor(cursor);
@@ -2690,7 +2757,7 @@ var MathCommand = P(MathElement, function(_, super_) {
       if (text && cmd.textTemplate[i] === '('
           && child_text[0] === '(' && child_text.slice(-1) === ')')
         return text + child_text.slice(1, -1) + cmd.textTemplate[i];
-      return text + child.text() + (cmd.textTemplate[i] || '');
+      return text + child_text + (cmd.textTemplate[i] || '');
     });
   };
 });
@@ -2819,7 +2886,9 @@ var MathBlock = P(MathElement, function(_, super_) {
   _.write = function(cursor, ch) {
     var cmd = this.chToCmd(ch, cursor.options);
     if (cursor.selection) cmd.replaces(cursor.replaceSelection());
-    cmd.createLeftOf(cursor.show());
+    if (!cursor.isTooDeep()) {
+      cmd.createLeftOf(cursor.show());
+    }
   };
 
   _.focus = function() {
@@ -2837,14 +2906,17 @@ var MathBlock = P(MathElement, function(_, super_) {
   };
 });
 
+Options.p.mouseEvents = true;
 API.StaticMath = function(APIClasses) {
   return P(APIClasses.AbstractMathQuill, function(_, super_) {
     this.RootBlock = MathBlock;
     _.__mathquillify = function(opts, interfaceVersion) {
       this.config(opts);
       super_.__mathquillify.call(this, 'mq-math-mode');
-      this.__controller.delegateMouseEvents();
-      this.__controller.staticMathTextareaEvents();
+      if (this.__options.mouseEvents) {
+        this.__controller.delegateMouseEvents();
+        this.__controller.staticMathTextareaEvents();
+      }
       return this;
     };
     _.init = function() {
@@ -2943,7 +3015,7 @@ var TextBlock = P(Node, function(_, super_) {
   _.latex = function() {
     var contents = this.textContents();
     if (contents.length === 0) return '';
-    return '\\text{' + contents + '}';
+    return '\\text{' + contents.replace(/\\/g, '\\backslash ').replace(/[{}]/g, '\\$&') + '}';
   };
   _.html = function() {
     return (
@@ -3303,7 +3375,7 @@ CharCmds['\\'] = P(MathCommand, function(_, super_) {
       if (ch.match(/[a-z]/i)) VanillaSymbol(ch).createLeftOf(cursor);
       else {
         this.parent.renderCommand(cursor);
-        if (ch !== '\\' || !this.isEmpty()) this.parent.parent.write(cursor, ch);
+        if (ch !== '\\' || !this.isEmpty()) cursor.parent.write(cursor, ch);
       }
     };
     this.ends[L].keystroke = function(key, e, ctrlr) {
@@ -3648,6 +3720,28 @@ var SupSub = P(MathCommand, function(_, super_) {
       };
     }(this, 'sub sup'.split(' ')[i], 'sup sub'.split(' ')[i], 'down up'.split(' ')[i]));
   };
+  _.reflow = function() {
+    var $block = this.jQ ;//mq-supsub
+    var $prev = $block.prev() ;
+
+    if ( !$prev.length ) {
+        //we cant normalize it without having prev. element (which is base)
+        return ;
+    }
+
+    var $sup = $block.children( '.mq-sup' );//mq-supsub -> mq-sup
+    if ( $sup.length ) {
+        var sup_fontsize = parseInt( $sup.css('font-size') ) ;
+        var sup_bottom = $sup.offset().top + $sup.height() ;
+        //we want that superscript overlaps top of base on 0.7 of its font-size
+        //this way small superscripts like x^2 look ok, but big ones like x^(1/2/3) too
+        var needed = sup_bottom - $prev.offset().top  - 0.7*sup_fontsize ;
+        var cur_margin = parseInt( $sup.css('margin-bottom' ) ) ;
+        //we lift it up with margin-bottom
+        $sup.css( 'margin-bottom', cur_margin + needed ) ;
+    }
+  } ;
+
 });
 
 function insLeftOfMeUnlessAtEnd(cursor) {
@@ -3693,15 +3787,6 @@ LatexCmds['^'] = P(SupSub, function(_, super_) {
     this.sup.downOutOf = insLeftOfMeUnlessAtEnd;
     super_.finalizeTree.call(this);
   };
-  _.reflow = function() {
-     var $block = this.jQ;//mq-supsub
-
-     var h = $block.prev().innerHeight() ;
-     h *= 0.6 ;
-
-     $block.css( 'vertical-align',  h + 'px' ) ;
-
-  } ;
 });
 
 var SummationNotation = P(MathCommand, function(_, super_) {
@@ -3830,7 +3915,7 @@ CharCmds['/'] = P(Fraction, function(_, super_) {
           leftward = leftward[R];
       }
 
-      if (leftward !== cursor[L]) {
+      if (leftward !== cursor[L] && !cursor.isTooDeep(1)) {
         this.replaces(Fragment(leftward[R] || cursor.parent.ends[L], cursor[L]));
         cursor[L] = leftward;
       }
@@ -4110,14 +4195,14 @@ LatexCmds.left = P(MathCommand, function(_) {
     var succeed = Parser.succeed;
     var optWhitespace = Parser.optWhitespace;
 
-    return optWhitespace.then(regex(/^(?:[([|]|\\\{|\\langle\b|\\lVert\b)/))
+    return optWhitespace.then(regex(/^(?:[([|]|\\\{|\\langle(?![a-zA-Z])|\\lVert(?![a-zA-Z]))/))
       .then(function(ctrlSeq) {
         var open = (ctrlSeq.charAt(0) === '\\' ? ctrlSeq.slice(1) : ctrlSeq);
 	if (ctrlSeq=="\\langle") { open = '&lang;'; ctrlSeq = ctrlSeq + ' '; }
 	if (ctrlSeq=="\\lVert") { open = '&#8741;'; ctrlSeq = ctrlSeq + ' '; }
         return latexMathParser.then(function (block) {
           return string('\\right').skip(optWhitespace)
-            .then(regex(/^(?:[\])|]|\\\}|\\rangle\b|\\rVert\b)/)).map(function(end) {
+            .then(regex(/^(?:[\])|]|\\\}|\\rangle(?![a-zA-Z])|\\rVert(?![a-zA-Z]))/)).map(function(end) {
               var close = (end.charAt(0) === '\\' ? end.slice(1) : end);
 	      if (end=="\\rangle") { close = '&rang;'; end = end + ' '; }
 	      if (end=="\\rVert") { close = '&#8741;'; end = end + ' '; }
@@ -4520,13 +4605,15 @@ LatexCmds.part = LatexCmds.partial = bind(VanillaSymbol,'\\partial ','&part;');
 LatexCmds.infty = LatexCmds.infin = LatexCmds.infinity =
   bind(VanillaSymbol,'\\infty ','&infin;');
 
+LatexCmds.pounds = bind(VanillaSymbol,'\\pounds ','&pound;');
+
 LatexCmds.alef = LatexCmds.alefsym = LatexCmds.aleph = LatexCmds.alephsym =
   bind(VanillaSymbol,'\\aleph ','&alefsym;');
 
 LatexCmds.xist = //LOL
 LatexCmds.xists = LatexCmds.exist = LatexCmds.exists =
   bind(VanillaSymbol,'\\exists ','&exist;');
-  
+
 LatexCmds.nexists = LatexCmds.nexist =
       bind(VanillaSymbol, '\\nexists ', '&#8708;');
 
@@ -5079,236 +5166,6 @@ LatexCmds['÷'] = LatexCmds.div = LatexCmds.divide = LatexCmds.divides =
   bind(BinaryOperator,'\\div ','&divide;', '[/]');
 
 CharCmds['~'] = LatexCmds.sim = bind(BinaryOperator, '\\sim ', '~', '~');
-suite('parser', function() {
-  var string = Parser.string;
-  var regex = Parser.regex;
-  var letter = Parser.letter;
-  var digit = Parser.digit;
-  var any = Parser.any;
-  var optWhitespace = Parser.optWhitespace;
-  var eof = Parser.eof;
-  var succeed = Parser.succeed;
-  var all = Parser.all;
-
-  test('Parser.string', function() {
-    var parser = string('x');
-    assert.equal(parser.parse('x'), 'x');
-    assert.throws(function() { parser.parse('y') })
-  });
-
-  test('Parser.regex', function() {
-    var parser = regex(/^[0-9]/);
-
-    assert.equal(parser.parse('1'), '1');
-    assert.equal(parser.parse('4'), '4');
-    assert.throws(function() { parser.parse('x'); });
-    assert.throws(function() { regex(/./) }, 'must be anchored');
-  });
-
-  suite('then', function() {
-    test('with a parser, uses the last return value', function() {
-      var parser = string('x').then(string('y'));
-      assert.equal(parser.parse('xy'), 'y');
-      assert.throws(function() { parser.parse('y'); });
-      assert.throws(function() { parser.parse('xz'); });
-    });
-
-    test('asserts that a parser is returned', function() {
-      var parser1 = letter.then(function() { return 'not a parser' });
-      assert.throws(function() { parser1.parse('x'); });
-
-      var parser2 = letter.then('x');
-      assert.throws(function() { letter.parse('xx'); });
-    });
-
-    test('with a function that returns a parser, continues with that parser', function() {
-      var piped;
-      var parser = string('x').then(function(x) {
-        piped = x;
-        return string('y');
-      });
-
-      assert.equal(parser.parse('xy'), 'y');
-      assert.equal(piped, 'x');
-      assert.throws(function() { parser.parse('x'); });
-    });
-  });
-
-  suite('map', function() {
-    test('with a function, pipes the value in and uses that return value', function() {
-      var piped;
-
-      var parser = string('x').map(function(x) {
-        piped = x;
-        return 'y';
-      });
-
-      assert.equal(parser.parse('x'), 'y')
-      assert.equal(piped, 'x');
-    });
-  });
-
-  suite('result', function() {
-    test('returns a constant result', function() {
-      var myResult = 1;
-      var oneParser = string('x').result(1);
-
-      assert.equal(oneParser.parse('x'), 1);
-
-      var myFn = function() {};
-      var fnParser = string('x').result(myFn);
-
-      assert.equal(fnParser.parse('x'), myFn);
-    });
-  });
-
-  suite('skip', function() {
-    test('uses the previous return value', function() {
-      var parser = string('x').skip(string('y'));
-
-      assert.equal(parser.parse('xy'), 'x');
-      assert.throws(function() { parser.parse('x'); });
-    });
-  });
-
-  suite('or', function() {
-    test('two parsers', function() {
-      var parser = string('x').or(string('y'));
-
-      assert.equal(parser.parse('x'), 'x');
-      assert.equal(parser.parse('y'), 'y');
-      assert.throws(function() { parser.parse('z') });
-    });
-
-    test('with then', function() {
-      var parser = string('\\')
-        .then(function() {
-          return string('y')
-        }).or(string('z'));
-
-      assert.equal(parser.parse('\\y'), 'y');
-      assert.equal(parser.parse('z'), 'z');
-      assert.throws(function() { parser.parse('\\z') });
-    });
-  });
-
-  function assertEqualArray(arr1, arr2) {
-    assert.equal(arr1.join(), arr2.join());
-  }
-
-  suite('many', function() {
-    test('simple case', function() {
-      var letters = letter.many();
-
-      assertEqualArray(letters.parse('x'), ['x']);
-      assertEqualArray(letters.parse('xyz'), ['x','y','z']);
-      assertEqualArray(letters.parse(''), []);
-      assert.throws(function() { letters.parse('1'); });
-      assert.throws(function() { letters.parse('xyz1'); });
-    });
-
-    test('followed by then', function() {
-      var parser = string('x').many().then(string('y'));
-
-      assert.equal(parser.parse('y'), 'y');
-      assert.equal(parser.parse('xy'), 'y');
-      assert.equal(parser.parse('xxxxxy'), 'y');
-    });
-  });
-
-  suite('times', function() {
-    test('zero case', function() {
-      var zeroLetters = letter.times(0);
-
-      assertEqualArray(zeroLetters.parse(''), []);
-      assert.throws(function() { zeroLetters.parse('x'); });
-    });
-
-    test('nonzero case', function() {
-      var threeLetters = letter.times(3);
-
-      assertEqualArray(threeLetters.parse('xyz'), ['x', 'y', 'z']);
-      assert.throws(function() { threeLetters.parse('xy'); });
-      assert.throws(function() { threeLetters.parse('xyzw'); });
-
-      var thenDigit = threeLetters.then(digit);
-      assert.equal(thenDigit.parse('xyz1'), '1');
-      assert.throws(function() { thenDigit.parse('xy1'); });
-      assert.throws(function() { thenDigit.parse('xyz'); });
-      assert.throws(function() { thenDigit.parse('xyzw'); });
-    });
-
-    test('with a min and max', function() {
-      var someLetters = letter.times(2, 4);
-
-      assertEqualArray(someLetters.parse('xy'), ['x', 'y']);
-      assertEqualArray(someLetters.parse('xyz'), ['x', 'y', 'z']);
-      assertEqualArray(someLetters.parse('xyzw'), ['x', 'y', 'z', 'w']);
-      assert.throws(function() { someLetters.parse('xyzwv'); });
-      assert.throws(function() { someLetters.parse('x'); });
-
-      var thenDigit = someLetters.then(digit);
-      assert.equal(thenDigit.parse('xy1'), '1');
-      assert.equal(thenDigit.parse('xyz1'), '1');
-      assert.equal(thenDigit.parse('xyzw1'), '1');
-      assert.throws(function() { thenDigit.parse('xy'); });
-      assert.throws(function() { thenDigit.parse('xyzw'); });
-      assert.throws(function() { thenDigit.parse('xyzwv1'); });
-      assert.throws(function() { thenDigit.parse('x1'); });
-    });
-
-    test('atLeast', function() {
-      var atLeastTwo = letter.atLeast(2);
-
-      assertEqualArray(atLeastTwo.parse('xy'), ['x', 'y']);
-      assertEqualArray(atLeastTwo.parse('xyzw'), ['x', 'y', 'z', 'w']);
-      assert.throws(function() { atLeastTwo.parse('x'); });
-    });
-  });
-
-  suite('fail', function() {
-    var fail = Parser.fail;
-    var succeed = Parser.succeed;
-
-    test('use Parser.fail to fail dynamically', function() {
-      var parser = any.then(function(ch) {
-        return fail('character '+ch+' not allowed');
-      }).or(string('x'));
-
-      assert.throws(function() { parser.parse('y'); });
-      assert.equal(parser.parse('x'), 'x');
-    });
-
-    test('use Parser.succeed or Parser.fail to branch conditionally', function() {
-      var allowedOperator;
-
-      var parser =
-        string('x')
-        .then(string('+').or(string('*')))
-        .then(function(operator) {
-          if (operator === allowedOperator) return succeed(operator);
-          else return fail('expected '+allowedOperator);
-        })
-        .skip(string('y'))
-      ;
-
-      allowedOperator = '+';
-      assert.equal(parser.parse('x+y'), '+');
-      assert.throws(function() { parser.parse('x*y'); });
-
-      allowedOperator = '*';
-      assert.equal(parser.parse('x*y'), '*');
-      assert.throws(function() { parser.parse('x+y'); });
-    });
-  });
-
-  test('eof', function() {
-    var parser = optWhitespace.skip(eof).or(all.result('default'));
-
-    assert.equal(parser.parse('  '), '  ')
-    assert.equal(parser.parse('x'), 'default');
-  });
-});
 suite('HTML', function() {
   function renderHtml(numBlocks, htmlTemplate) {
     var cmd = {
@@ -5408,6 +5265,105 @@ suite('HTML', function() {
     assert.equal(html, renderHtml(2, htmlTemplate), 'multiple nested cmd and block spans');
   });
 });
+suite('text', function() {
+
+  function fromLatex(latex) {
+    var block = latexMathParser.parse(latex);
+    block.jQize();
+
+    return block;
+  }
+
+  function assertSplit(jQ, prev, next) {
+    var dom = jQ[0];
+
+    if (prev) {
+      assert.ok(dom.previousSibling instanceof Text);
+      assert.equal(prev, dom.previousSibling.data);
+    }
+    else {
+      assert.ok(!dom.previousSibling);
+    }
+
+    if (next) {
+      assert.ok(dom.nextSibling instanceof Text);
+      assert.equal(next, dom.nextSibling.data);
+    }
+    else {
+      assert.ok(!dom.nextSibling);
+    }
+  }
+
+  test('changes the text nodes as the cursor moves around', function() {
+    var block = fromLatex('\\text{abc}');
+    var ctrlr = Controller(block, 0, 0);
+    var cursor = ctrlr.cursor.insAtRightEnd(block);
+
+    ctrlr.moveLeft();
+    assertSplit(cursor.jQ, 'abc', null);
+
+    ctrlr.moveLeft();
+    assertSplit(cursor.jQ, 'ab', 'c');
+
+    ctrlr.moveLeft();
+    assertSplit(cursor.jQ, 'a', 'bc');
+
+    ctrlr.moveLeft();
+    assertSplit(cursor.jQ, null, 'abc');
+
+    ctrlr.moveRight();
+    assertSplit(cursor.jQ, 'a', 'bc');
+
+    ctrlr.moveRight();
+    assertSplit(cursor.jQ, 'ab', 'c');
+
+    ctrlr.moveRight();
+    assertSplit(cursor.jQ, 'abc', null);
+  });
+
+  test('does not change latex as the cursor moves around', function() {
+    var block = fromLatex('\\text{x}');
+    var ctrlr = Controller(block, 0, 0);
+    var cursor = ctrlr.cursor.insAtRightEnd(block);
+
+    ctrlr.moveLeft();
+    ctrlr.moveLeft();
+    ctrlr.moveLeft();
+
+    assert.equal(block.latex(), '\\text{x}');
+  });
+
+  test('stepping out of an empty block deletes it', function() {
+    var mq = MathQuill.MathField($('<span></span>').appendTo('#mock')[0]);
+    var controller = mq.__controller;
+    var cursor = controller.cursor;
+
+    mq.latex('\\text{x}');
+
+    mq.keystroke('Left');
+    assertSplit(cursor.jQ, 'x');
+
+    mq.keystroke('Backspace');
+    assertSplit(cursor.jQ);
+
+    mq.keystroke('Right');
+    assertSplit(cursor.jQ);
+    assert.equal(cursor[L], 0);
+  });
+
+  test('typing $ in a textblock splits it', function() {
+    var mq = MathQuill.MathField($('<span></span>').appendTo('#mock')[0]);
+    var controller = mq.__controller;
+    var cursor = controller.cursor;
+
+    mq.latex('\\text{asdf}');
+    mq.keystroke('Left Left Left');
+    assertSplit(cursor.jQ, 'as', 'df');
+
+    mq.typedText('$');
+    assert.equal(mq.latex(), '\\text{as}\\text{df}');
+  });
+});
 suite('typing with auto-replaces', function() {
   var mq;
   setup(function() {
@@ -5466,6 +5422,11 @@ suite('typing with auto-replaces', function() {
     test('dollar sign', function() {
       mq.typedText('$');
       assertLatex('\\$');
+    });
+
+    test('\\text followed by command', function() {
+      mq.typedText('\\text{');
+      assertLatex('\\text{\\{}');
     });
   });
 
@@ -5880,6 +5841,26 @@ suite('typing with auto-replaces', function() {
         assertLatex('\\left(1+2\\right)+\\left(3+4\\right)+5');
         mq.keystroke('Left Left Left Left Backspace');
         assertLatex('\\left(1+2\\right)+3+4+5');
+      });
+
+      test('typing Ctrl-Backspace deletes everything to the left of the cursor', function () {
+        mq.typedText('12345');
+        assertLatex('12345');
+        mq.keystroke('Left Left');
+        mq.keystroke('Ctrl-Backspace');
+        assertLatex('45');
+        mq.keystroke('Ctrl-Backspace');
+        assertLatex('45');
+      });
+
+      test('typing Ctrl-Del deletes everything to the right of the cursor', function () {
+        mq.typedText('12345');
+        assertLatex('12345');
+        mq.keystroke('Left Left');
+        mq.keystroke('Ctrl-Del');
+        assertLatex('123');
+        mq.keystroke('Ctrl-Del');
+        assertLatex('123');
       });
 
       suite('pipes', function() {
@@ -7207,7 +7188,7 @@ suite('latex', function() {
     assert.equal(tree.join('latex'), '\\left(123\\right)');
   });
 
-  test('langle/rangle (issue #508)', function() {
+  test('\\langle/\\rangle (issue #508)', function() {
     var tree = latexMathParser.parse('\\left\\langle 123\\right\\rangle)');
 
     assert.ok(tree.ends[L] instanceof Bracket);
@@ -7216,7 +7197,16 @@ suite('latex', function() {
     assert.equal(tree.join('latex'), '\\left\\langle 123\\right\\rangle )');
   });
 
-  test('lVert/rVert', function() {
+  test('\\langle/\\rangle (without whitespace)', function() {
+    var tree = latexMathParser.parse('\\left\\langle123\\right\\rangle)');
+
+    assert.ok(tree.ends[L] instanceof Bracket);
+    var contents = tree.ends[L].ends[L].join('latex');
+    assert.equal(contents, '123');
+    assert.equal(tree.join('latex'), '\\left\\langle 123\\right\\rangle )');
+  });
+
+  test('\\lVert/\\rVert', function() {
     var tree = latexMathParser.parse('\\left\\lVert 123\\right\\rVert)');
 
     assert.ok(tree.ends[L] instanceof Bracket);
@@ -7225,6 +7215,27 @@ suite('latex', function() {
     assert.equal(tree.join('latex'), '\\left\\lVert 123\\right\\rVert )');
   });
 
+  test('\\lVert/\\rVert (without whitespace)', function() {
+    var tree = latexMathParser.parse('\\left\\lVert123\\right\\rVert)');
+
+    assert.ok(tree.ends[L] instanceof Bracket);
+    var contents = tree.ends[L].ends[L].join('latex');
+    assert.equal(contents, '123');
+    assert.equal(tree.join('latex'), '\\left\\lVert 123\\right\\rVert )');
+  });
+
+  test('\\langler should not parse', function() {
+    assert.throws(function () {
+      latexMathParser.parse('\\left\\langler123\\right\\rangler');
+    })
+  });
+
+  test('\\lVerte should not parse', function() {
+    assert.throws(function () {
+      latexMathParser.parse('\\left\\lVerte123\\right\\rVerte');
+    })
+  });
+  
   test('parens with whitespace', function() {
     assertParsesLatex('\\left ( 123 \\right ) ', '\\left(123\\right)');
   });
@@ -8002,6 +8013,7 @@ suite('Public API', function() {
       assert.ok(rootBlock.hasClass('mq-empty'));
       assert.ok(!rootBlock.hasClass('mq-hasCursor'));
     });
+
   });
 
   suite('mathquill-basic', function() {
@@ -8061,7 +8073,7 @@ suite('Public API', function() {
       mq.latex('x+y');
       assert.equal(mq.html(), '<var>x</var><span class="mq-binary-operator">+</span><var>y</var>');
     });
-    
+
     test('.text() with incomplete commands', function() {
       assert.equal(mq.text(), '');
       mq.typedText('\\');
@@ -8109,6 +8121,12 @@ suite('Public API', function() {
       mq.moveToRightEnd();
       assert.equal(mq.__controller.cursor[L].ctrlSeq, '0');
       assert.equal(mq.__controller.cursor[R], 0);
+    });
+
+    test('.empty()', function() {
+      mq.latex('xyz');
+      mq.empty();
+      assert.equal(mq.latex(), '');
     });
   });
 
@@ -8400,6 +8418,37 @@ suite('Public API', function() {
     });
   });
 
+  suite('maxDepth option', function() {
+    setup(function() {
+      mq = MQ.MathField($('<span></span>').appendTo('#mock')[0], {
+        maxDepth: 1
+      });
+    });
+    teardown(function() {
+      $(mq.el()).remove();
+    });
+
+    test('prevents nested math input via .write() method', function() {
+      mq.write('1\\frac{\\frac{3}{3}}{2}');
+      assert.equal(mq.latex(), '1\\frac{ }{ }');
+    });
+
+    test('prevents nested math input via keyboard input', function() {
+      mq.cmd('/').write('x');
+      assert.equal(mq.latex(), '\\frac{ }{ }');
+    });
+
+    test('stops new fraction moving content into numerator', function() {
+      mq.write('x').cmd('/');
+      assert.equal(mq.latex(), 'x\\frac{ }{ }');
+    });
+
+    test('prevents nested math input via replacedFragment', function() {
+      mq.cmd('(').keystroke('Left').cmd('(')
+      assert.equal(mq.latex(), '\\left(\\right)');
+    });
+  });
+
   suite('statelessClipboard option', function() {
     suite('default', function() {
       var mq, textarea;
@@ -8468,7 +8517,7 @@ suite('Public API', function() {
       });
       test('backslashes', function() {
         assertPaste('something \\pi something \\asdf',
-                    '\\text{something \\pi something \\asdf}');
+                    '\\text{something \\backslash pi something \\backslash asdf}');
       });
       // TODO: braces (currently broken)
       test('actual math LaTeX wrapped in dollar signs', function() {
@@ -9373,103 +9422,234 @@ suite('focusBlur', function() {
     });
   });
 });
-suite('text', function() {
+suite('parser', function() {
+  var string = Parser.string;
+  var regex = Parser.regex;
+  var letter = Parser.letter;
+  var digit = Parser.digit;
+  var any = Parser.any;
+  var optWhitespace = Parser.optWhitespace;
+  var eof = Parser.eof;
+  var succeed = Parser.succeed;
+  var all = Parser.all;
 
-  function fromLatex(latex) {
-    var block = latexMathParser.parse(latex);
-    block.jQize();
+  test('Parser.string', function() {
+    var parser = string('x');
+    assert.equal(parser.parse('x'), 'x');
+    assert.throws(function() { parser.parse('y') })
+  });
 
-    return block;
+  test('Parser.regex', function() {
+    var parser = regex(/^[0-9]/);
+
+    assert.equal(parser.parse('1'), '1');
+    assert.equal(parser.parse('4'), '4');
+    assert.throws(function() { parser.parse('x'); });
+    assert.throws(function() { regex(/./) }, 'must be anchored');
+  });
+
+  suite('then', function() {
+    test('with a parser, uses the last return value', function() {
+      var parser = string('x').then(string('y'));
+      assert.equal(parser.parse('xy'), 'y');
+      assert.throws(function() { parser.parse('y'); });
+      assert.throws(function() { parser.parse('xz'); });
+    });
+
+    test('asserts that a parser is returned', function() {
+      var parser1 = letter.then(function() { return 'not a parser' });
+      assert.throws(function() { parser1.parse('x'); });
+
+      var parser2 = letter.then('x');
+      assert.throws(function() { letter.parse('xx'); });
+    });
+
+    test('with a function that returns a parser, continues with that parser', function() {
+      var piped;
+      var parser = string('x').then(function(x) {
+        piped = x;
+        return string('y');
+      });
+
+      assert.equal(parser.parse('xy'), 'y');
+      assert.equal(piped, 'x');
+      assert.throws(function() { parser.parse('x'); });
+    });
+  });
+
+  suite('map', function() {
+    test('with a function, pipes the value in and uses that return value', function() {
+      var piped;
+
+      var parser = string('x').map(function(x) {
+        piped = x;
+        return 'y';
+      });
+
+      assert.equal(parser.parse('x'), 'y')
+      assert.equal(piped, 'x');
+    });
+  });
+
+  suite('result', function() {
+    test('returns a constant result', function() {
+      var myResult = 1;
+      var oneParser = string('x').result(1);
+
+      assert.equal(oneParser.parse('x'), 1);
+
+      var myFn = function() {};
+      var fnParser = string('x').result(myFn);
+
+      assert.equal(fnParser.parse('x'), myFn);
+    });
+  });
+
+  suite('skip', function() {
+    test('uses the previous return value', function() {
+      var parser = string('x').skip(string('y'));
+
+      assert.equal(parser.parse('xy'), 'x');
+      assert.throws(function() { parser.parse('x'); });
+    });
+  });
+
+  suite('or', function() {
+    test('two parsers', function() {
+      var parser = string('x').or(string('y'));
+
+      assert.equal(parser.parse('x'), 'x');
+      assert.equal(parser.parse('y'), 'y');
+      assert.throws(function() { parser.parse('z') });
+    });
+
+    test('with then', function() {
+      var parser = string('\\')
+        .then(function() {
+          return string('y')
+        }).or(string('z'));
+
+      assert.equal(parser.parse('\\y'), 'y');
+      assert.equal(parser.parse('z'), 'z');
+      assert.throws(function() { parser.parse('\\z') });
+    });
+  });
+
+  function assertEqualArray(arr1, arr2) {
+    assert.equal(arr1.join(), arr2.join());
   }
 
-  function assertSplit(jQ, prev, next) {
-    var dom = jQ[0];
+  suite('many', function() {
+    test('simple case', function() {
+      var letters = letter.many();
 
-    if (prev) {
-      assert.ok(dom.previousSibling instanceof Text);
-      assert.equal(prev, dom.previousSibling.data);
-    }
-    else {
-      assert.ok(!dom.previousSibling);
-    }
+      assertEqualArray(letters.parse('x'), ['x']);
+      assertEqualArray(letters.parse('xyz'), ['x','y','z']);
+      assertEqualArray(letters.parse(''), []);
+      assert.throws(function() { letters.parse('1'); });
+      assert.throws(function() { letters.parse('xyz1'); });
+    });
 
-    if (next) {
-      assert.ok(dom.nextSibling instanceof Text);
-      assert.equal(next, dom.nextSibling.data);
-    }
-    else {
-      assert.ok(!dom.nextSibling);
-    }
-  }
+    test('followed by then', function() {
+      var parser = string('x').many().then(string('y'));
 
-  test('changes the text nodes as the cursor moves around', function() {
-    var block = fromLatex('\\text{abc}');
-    var ctrlr = Controller(block, 0, 0);
-    var cursor = ctrlr.cursor.insAtRightEnd(block);
-
-    ctrlr.moveLeft();
-    assertSplit(cursor.jQ, 'abc', null);
-
-    ctrlr.moveLeft();
-    assertSplit(cursor.jQ, 'ab', 'c');
-
-    ctrlr.moveLeft();
-    assertSplit(cursor.jQ, 'a', 'bc');
-
-    ctrlr.moveLeft();
-    assertSplit(cursor.jQ, null, 'abc');
-
-    ctrlr.moveRight();
-    assertSplit(cursor.jQ, 'a', 'bc');
-
-    ctrlr.moveRight();
-    assertSplit(cursor.jQ, 'ab', 'c');
-
-    ctrlr.moveRight();
-    assertSplit(cursor.jQ, 'abc', null);
+      assert.equal(parser.parse('y'), 'y');
+      assert.equal(parser.parse('xy'), 'y');
+      assert.equal(parser.parse('xxxxxy'), 'y');
+    });
   });
 
-  test('does not change latex as the cursor moves around', function() {
-    var block = fromLatex('\\text{x}');
-    var ctrlr = Controller(block, 0, 0);
-    var cursor = ctrlr.cursor.insAtRightEnd(block);
+  suite('times', function() {
+    test('zero case', function() {
+      var zeroLetters = letter.times(0);
 
-    ctrlr.moveLeft();
-    ctrlr.moveLeft();
-    ctrlr.moveLeft();
+      assertEqualArray(zeroLetters.parse(''), []);
+      assert.throws(function() { zeroLetters.parse('x'); });
+    });
 
-    assert.equal(block.latex(), '\\text{x}');
+    test('nonzero case', function() {
+      var threeLetters = letter.times(3);
+
+      assertEqualArray(threeLetters.parse('xyz'), ['x', 'y', 'z']);
+      assert.throws(function() { threeLetters.parse('xy'); });
+      assert.throws(function() { threeLetters.parse('xyzw'); });
+
+      var thenDigit = threeLetters.then(digit);
+      assert.equal(thenDigit.parse('xyz1'), '1');
+      assert.throws(function() { thenDigit.parse('xy1'); });
+      assert.throws(function() { thenDigit.parse('xyz'); });
+      assert.throws(function() { thenDigit.parse('xyzw'); });
+    });
+
+    test('with a min and max', function() {
+      var someLetters = letter.times(2, 4);
+
+      assertEqualArray(someLetters.parse('xy'), ['x', 'y']);
+      assertEqualArray(someLetters.parse('xyz'), ['x', 'y', 'z']);
+      assertEqualArray(someLetters.parse('xyzw'), ['x', 'y', 'z', 'w']);
+      assert.throws(function() { someLetters.parse('xyzwv'); });
+      assert.throws(function() { someLetters.parse('x'); });
+
+      var thenDigit = someLetters.then(digit);
+      assert.equal(thenDigit.parse('xy1'), '1');
+      assert.equal(thenDigit.parse('xyz1'), '1');
+      assert.equal(thenDigit.parse('xyzw1'), '1');
+      assert.throws(function() { thenDigit.parse('xy'); });
+      assert.throws(function() { thenDigit.parse('xyzw'); });
+      assert.throws(function() { thenDigit.parse('xyzwv1'); });
+      assert.throws(function() { thenDigit.parse('x1'); });
+    });
+
+    test('atLeast', function() {
+      var atLeastTwo = letter.atLeast(2);
+
+      assertEqualArray(atLeastTwo.parse('xy'), ['x', 'y']);
+      assertEqualArray(atLeastTwo.parse('xyzw'), ['x', 'y', 'z', 'w']);
+      assert.throws(function() { atLeastTwo.parse('x'); });
+    });
   });
 
-  test('stepping out of an empty block deletes it', function() {
-    var mq = MathQuill.MathField($('<span></span>').appendTo('#mock')[0]);
-    var controller = mq.__controller;
-    var cursor = controller.cursor;
+  suite('fail', function() {
+    var fail = Parser.fail;
+    var succeed = Parser.succeed;
 
-    mq.latex('\\text{x}');
+    test('use Parser.fail to fail dynamically', function() {
+      var parser = any.then(function(ch) {
+        return fail('character '+ch+' not allowed');
+      }).or(string('x'));
 
-    mq.keystroke('Left');
-    assertSplit(cursor.jQ, 'x');
+      assert.throws(function() { parser.parse('y'); });
+      assert.equal(parser.parse('x'), 'x');
+    });
 
-    mq.keystroke('Backspace');
-    assertSplit(cursor.jQ);
+    test('use Parser.succeed or Parser.fail to branch conditionally', function() {
+      var allowedOperator;
 
-    mq.keystroke('Right');
-    assertSplit(cursor.jQ);
-    assert.equal(cursor[L], 0);
+      var parser =
+        string('x')
+        .then(string('+').or(string('*')))
+        .then(function(operator) {
+          if (operator === allowedOperator) return succeed(operator);
+          else return fail('expected '+allowedOperator);
+        })
+        .skip(string('y'))
+      ;
+
+      allowedOperator = '+';
+      assert.equal(parser.parse('x+y'), '+');
+      assert.throws(function() { parser.parse('x*y'); });
+
+      allowedOperator = '*';
+      assert.equal(parser.parse('x*y'), '*');
+      assert.throws(function() { parser.parse('x+y'); });
+    });
   });
 
-  test('typing $ in a textblock splits it', function() {
-    var mq = MathQuill.MathField($('<span></span>').appendTo('#mock')[0]);
-    var controller = mq.__controller;
-    var cursor = controller.cursor;
+  test('eof', function() {
+    var parser = optWhitespace.skip(eof).or(all.result('default'));
 
-    mq.latex('\\text{asdf}');
-    mq.keystroke('Left Left Left');
-    assertSplit(cursor.jQ, 'as', 'df');
-
-    mq.typedText('$');
-    assert.equal(mq.latex(), '\\text{as}\\text{df}');
+    assert.equal(parser.parse('  '), '  ')
+    assert.equal(parser.parse('x'), 'default');
   });
 });
 suite('SupSub', function() {
